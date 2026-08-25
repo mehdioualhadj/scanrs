@@ -1,0 +1,11 @@
+﻿Merge into your existing autounattend.xml (OOBE section):
+
+<FirstLogonCommands>
+    <SynchronousCommand wcm:action="add">
+        <Order>1</Order>
+        <CommandLine>cmd /c "for %d in (C D E F G H) do @if exist %d\scanrs-workstation\install.ps1 (powershell -ExecutionPolicy Bypass -File %d\scanrs-workstation\install.ps1)"</CommandLine>
+        <Description>install scanrs workstation</Description>
+    </SynchronousCommand>
+</FirstLogonCommands>
+
+Attach dist\scanrs-workstation as a second ISO or shared folder.

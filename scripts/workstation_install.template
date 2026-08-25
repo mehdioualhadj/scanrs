@@ -1,0 +1,16 @@
+﻿$ErrorActionPreference = 'Stop'
+$here = $PSScriptRoot
+$dest = Join-Path $env:LOCALAPPDATA 'scanrs'
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Copy-Item "$here\bin\scanrs.exe" $dest -Force
+Copy-Item "$here\tesseract" $dest -Recurse -Force
+$p = [Environment]::GetEnvironmentVariable('Path','User')
+foreach ($d in @($dest, "$dest\tesseract")) {
+    if ($p -notlike "*$d*") { $p = "$p;$d" }
+}
+[Environment]::SetEnvironmentVariable('Path', $p, 'User')
+$exe = Join-Path $dest 'scanrs.exe'
+reg add "HKCU\Software\Classes\SystemFileAssociations\image\shell\scanrs" /ve /d "Scan with scanrs" /f | Out-Null
+reg add "HKCU\Software\Classes\SystemFileAssociations\image\shell\scanrs\command" /ve /d "`"$exe`" `"%1`"" /f | Out-Null
+Write-Host "workstation installed to $dest"
+Write-Host "open a NEW terminal, then: scanrs --selftest13"
