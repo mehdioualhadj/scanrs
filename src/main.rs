@@ -948,17 +948,15 @@ fn dewarp_stage(gray: &GrayImage, rgb: &RgbImage, out_dir: &PathBuf) -> (GrayIma
     let (w, h) = (gray.width(), gray.height());
     let lines = extract_baselines(gray);
 
-    let mut bow_before = 0.0f64;
-    for line in &lines {
-        let ys: Vec<f64> = line.iter().map(|p| p.1).collect();
-        let mn = ys.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mx = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        bow_before = bow_before.max(mx - mn);
-    }
+    let bows: Vec<f64> = lines.iter().map(|line| line_bow(line)).collect();
+    let mut bs = bows.clone();
+    bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let bow_before = if bs.is_empty() { 0.0 } else { bs[bs.len() / 2] };
     if bow_before < 3.0 {
-        println!("dewarp_skipped   : straight (bow {bow_before:.2})");
+        println!("dewarp_skipped   : straight (median bow {bow_before:.2})");
         return (gray.clone(), rgb.clone());
     }
+    let bow_cap = bow_before * 3.0 + 2.0;
 
     let mut ctrl: Vec<(f64, f64)> = Vec::new();
     let mut val: Vec<(f64, f64)> = Vec::new();
@@ -967,7 +965,10 @@ fn dewarp_stage(gray: &GrayImage, rgb: &RgbImage, out_dir: &PathBuf) -> (GrayIma
     ctrl.push((w as f64, h as f64)); val.push((w as f64, h as f64));
     ctrl.push((0.0, h as f64)); val.push((0.0, h as f64));
 
-    for line in &lines {
+    for (line, b) in lines.iter().zip(bows.iter()) {
+        if *b > bow_cap {
+            continue;
+        }
         let ys: Vec<f64> = line.iter().map(|p| p.1).collect();
         let mut sorted = ys.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1045,6 +1046,26 @@ fn dewarp_stage(gray: &GrayImage, rgb: &RgbImage, out_dir: &PathBuf) -> (GrayIma
 
     (g2, r2)
 }
+fn line_bow(line: &[(f64, f64)]) -> f64 {
+    let n = line.len() as f64;
+    if n < 3.0 {
+        return 0.0;
+    }
+    let sx: f64 = line.iter().map(|p| p.0).sum();
+    let sy: f64 = line.iter().map(|p| p.1).sum();
+    let sxx: f64 = line.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = line.iter().map(|p| p.0 * p.1).sum();
+    let den = n * sxx - sx * sx;
+    if den.abs() < 1e-9 {
+        return 0.0;
+    }
+    let a = (n * sxy - sx * sy) / den;
+    let b = (sy - a * sx) / n;
+    line.iter()
+        .map(|p| (p.1 - (a * p.0 + b)).abs())
+        .fold(0.0f64, f64::max)
+}
+
 fn auto_landmarks(gray: &GrayImage) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, f64) {
     let (w, h) = (gray.width(), gray.height());
     let lines = extract_baselines(gray);
@@ -1054,12 +1075,16 @@ fn auto_landmarks(gray: &GrayImage) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, f64) {
     ctrl.push((w as f64, 0.0)); val.push((w as f64, 0.0));
     ctrl.push((w as f64, h as f64)); val.push((w as f64, h as f64));
     ctrl.push((0.0, h as f64)); val.push((0.0, h as f64));
-    let mut bow = 0.0f64;
-    for line in &lines {
+    let bows: Vec<f64> = lines.iter().map(|line| line_bow(line)).collect();
+    let mut bs = bows.clone();
+    bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let bow = if bs.is_empty() { 0.0 } else { bs[bs.len() / 2] };
+    let bow_cap = bow * 3.0 + 2.0;
+    for (line, b) in lines.iter().zip(bows.iter()) {
+        if *b > bow_cap {
+            continue;
+        }
         let ys: Vec<f64> = line.iter().map(|p| p.1).collect();
-        let mn = ys.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mx = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        bow = bow.max(mx - mn);
         let mut sorted = ys.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let my = sorted[sorted.len() / 2];
@@ -1264,7 +1289,7 @@ fn cleanup_debug(out_dir: &PathBuf) {
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let images_dir = root.join("images");
+    let images_dir = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string())).join("scanrs").join("images");
 
     let args: Vec<String> = env::args().collect();
     let mut input: Option<PathBuf> = None;
