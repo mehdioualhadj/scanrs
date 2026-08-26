@@ -1,7 +1,7 @@
 # scanrs
 
 Turns photos / screenshots of documents into searchable PDFs.
-Built for Windows 11 IoT LTSC workstations; no admin required.
+Built for Windows ; no admin required.
 
 ## Pipeline
 1. multi-page split (separator detection)
