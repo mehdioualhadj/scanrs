@@ -888,11 +888,135 @@ fn selftest13(out_dir: &PathBuf) {
         println!("STEP13_FAIL");
     }
 }
+fn smooth_line(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let fit = |q: &[(f64, f64)]| -> Option<(f64, f64, f64)> {
+        let n = q.len() as f64;
+        if n < 5.0 {
+            return None;
+        }
+        let (mut sx, mut sx2, mut sx3, mut sx4) = (0.0, 0.0, 0.0, 0.0);
+        let (mut sy, mut sxy, mut sx2y) = (0.0, 0.0, 0.0);
+        for (x, y) in q {
+            let x2 = x * x;
+            sx += x;
+            sx2 += x2;
+            sx3 += x2 * x;
+            sx4 += x2 * x2;
+            sy += y;
+            sxy += x * y;
+            sx2y += x2 * y;
+        }
+        let mut a = [[n, sx, sx2, sy], [sx, sx2, sx3, sxy], [sx2, sx3, sx4, sx2y]];
+        for i in 0..3 {
+            let mut p = i;
+            for j in (i + 1)..3 {
+                if a[j][i].abs() > a[p][i].abs() {
+                    p = j;
+                }
+            }
+            if a[p][i].abs() < 1e-9 {
+                return None;
+            }
+            a.swap(i, p);
+            for j in 0..3 {
+                if j != i {
+                    let f = a[j][i] / a[i][i];
+                    for k in i..4 {
+                        a[j][k] -= f * a[i][k];
+                    }
+                }
+            }
+        }
+        Some((a[2][3] / a[2][2], a[1][3] / a[1][1], a[0][3] / a[0][0]))
+    };
+    let Some(coef) = fit(pts) else {
+        return pts.to_vec();
+    };
+    let keep: Vec<(f64, f64)> = pts
+        .iter()
+        .copied()
+        .filter(|(x, y)| (coef.0 * x * x + coef.1 * x + coef.2 - y).abs() < 4.0)
+        .collect();
+    let coef = fit(&keep).unwrap_or(coef);
+    let x0 = pts.first().unwrap().0;
+    let x1 = pts.last().unwrap().0;
+    (0..=8)
+        .map(|k| {
+            let x = x0 + (x1 - x0) * k as f64 / 8.0;
+            (x, coef.0 * x * x + coef.1 * x + coef.2)
+        })
+        .collect()
+}
+
+fn baselines_from_tsv(gray: &GrayImage) -> Vec<Vec<(f64, f64)>> {
+    let tmp = std::env::temp_dir().join(format!("scanrs_tsvin_{}.png", std::process::id()));
+    if gray.save(&tmp).is_err() {
+        return Vec::new();
+    }
+    let outbase = std::env::temp_dir().join(format!("scanrs_tsvout_{}", std::process::id()));
+    let st = std::process::Command::new("tesseract")
+        .arg(tmp.to_string_lossy().to_string())
+        .arg(outbase.to_string_lossy().to_string())
+        .arg("tsv")
+        .output();
+    let _ = std::fs::remove_file(&tmp);
+    let Ok(st) = st else {
+        return Vec::new();
+    };
+    if !st.status.success() {
+        return Vec::new();
+    }
+    let tsvpath = format!("{}.tsv", outbase.to_string_lossy());
+    let tsv = std::fs::read_to_string(&tsvpath).unwrap_or_default();
+    let _ = std::fs::remove_file(&tsvpath);
+    let mut groups: std::collections::BTreeMap<(String, String, String, String), Vec<(f64, f64)>> =
+        std::collections::BTreeMap::new();
+    for ln in tsv.lines().skip(1) {
+        let f: Vec<&str> = ln.split('\t').collect();
+        if f.len() < 12 {
+            continue;
+        }
+        let conf: f32 = f[10].parse().unwrap_or(-1.0);
+        let text = f[11].trim();
+        if conf < 0.0 || text.is_empty() {
+            continue;
+        }
+        let left: i32 = f[6].parse().unwrap_or(0);
+        let top: i32 = f[7].parse().unwrap_or(0);
+        let wd: i32 = f[8].parse().unwrap_or(0);
+        let ht: i32 = f[9].parse().unwrap_or(0);
+        let key = (
+            f[1].to_string(),
+            f[2].to_string(),
+            f[3].to_string(),
+            f[4].to_string(),
+        );
+        groups
+            .entry(key)
+            .or_default()
+            .push((left as f64 + wd as f64 / 2.0, (top + ht) as f64));
+    }
+    let mut lines: Vec<Vec<(f64, f64)>> = groups
+        .into_values()
+        .filter(|v| v.len() >= 3)
+        .map(|mut v| {
+            v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            smooth_line(&v)
+        })
+        .collect();
+    lines.sort_by_key(|v| v[0].1 as i64);
+    lines
+}
+
 fn extract_baselines(gray: &GrayImage) -> Vec<Vec<(f64, f64)>> {
-    let (w, h) = (gray.width(), gray.height());
     let smooth = median_filter(gray, 1, 1);
     let text = local_text_mask(&smooth, 16, 20);
-    let dil = dilate_mask(&text, 10, 3);
+    extract_baselines_mask(gray, &text, false)
+}
+
+fn extract_baselines_mask(gray: &GrayImage, text: &GrayImage, relaxed: bool) -> Vec<Vec<(f64, f64)>> {
+    let (w, h) = (gray.width(), gray.height());
+    let dil = dilate_mask(text, 10, 3);
     let labels = connected_components(&dil, Connectivity::Four, Luma([0u8]));
 
     #[derive(Clone)]
@@ -912,13 +1036,32 @@ fn extract_baselines(gray: &GrayImage) -> Vec<Vec<(f64, f64)>> {
         if y > lb.max_y { lb.max_y = y; }
     }
 
+    if relaxed {
+        let mut top: Vec<(u64, u32, u32)> = lbs
+            .iter()
+            .map(|lb| {
+                (
+                    lb.count,
+                    lb.max_x.saturating_sub(lb.min_x) + 1,
+                    lb.max_y.saturating_sub(lb.min_y) + 1,
+                )
+            })
+            .collect();
+        top.sort_by(|a, b| b.0.cmp(&a.0));
+        for t in top.iter().take(6) {
+            println!("baselines_dbg        : count={} bw={} bh={}", t.0, t.1, t.2);
+        }
+    }
     let mut lines: Vec<Vec<(f64, f64)>> = Vec::new();
     for lb in lbs.iter() {
         let bw = lb.max_x.saturating_sub(lb.min_x) + 1;
         let bh = lb.max_y.saturating_sub(lb.min_y) + 1;
-        if lb.count < (w as u64 * h as u64) / 200 { continue; }
-        if (bw as f64) < (w as f64) / 3.0 { continue; }
-        if (bh as f64) > (h as f64) / 8.0 { continue; }
+        let min_count = (w as u64 * h as u64) / if relaxed { 500 } else { 200 };
+        let min_bw = (w as f64) / if relaxed { 4.0 } else { 3.0 };
+        let max_bh = (h as f64) / if relaxed { 6.0 } else { 8.0 };
+        if lb.count < min_count { continue; }
+        if (bw as f64) < min_bw { continue; }
+        if (bh as f64) > max_bh { continue; }
 
         let mut pts = Vec::new();
         for k in 0..7 {
@@ -946,7 +1089,12 @@ fn extract_baselines(gray: &GrayImage) -> Vec<Vec<(f64, f64)>> {
 
 fn dewarp_stage(gray: &GrayImage, rgb: &RgbImage, out_dir: &PathBuf) -> (GrayImage, RgbImage) {
     let (w, h) = (gray.width(), gray.height());
-    let lines = extract_baselines(gray);
+    let mut lines = extract_baselines(gray);
+    if lines.len() < 3 {
+        println!("baselines_fallback   : masks failed, using tesseract line geometry");
+        lines = baselines_from_tsv(gray);
+        println!("baselines_fallback   : tsv lines = {}", lines.len());
+    }
 
     let bows: Vec<f64> = lines.iter().map(|line| line_bow(line)).collect();
     let mut bs = bows.clone();
@@ -1068,7 +1216,12 @@ fn line_bow(line: &[(f64, f64)]) -> f64 {
 
 fn auto_landmarks(gray: &GrayImage) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, f64) {
     let (w, h) = (gray.width(), gray.height());
-    let lines = extract_baselines(gray);
+    let mut lines = extract_baselines(gray);
+    if lines.len() < 3 {
+        println!("baselines_fallback   : masks failed, using tesseract line geometry");
+        lines = baselines_from_tsv(gray);
+        println!("baselines_fallback   : tsv lines = {}", lines.len());
+    }
     let mut ctrl: Vec<(f64, f64)> = Vec::new();
     let mut val: Vec<(f64, f64)> = Vec::new();
     ctrl.push((0.0, 0.0)); val.push((0.0, 0.0));
@@ -1268,6 +1421,56 @@ fn gui_session(gray: &GrayImage, rgb: &RgbImage, ctrl: &[(f64, f64)], val: &[(f6
     println!("gui_landmarks    : {}", out_ctrl.len());
     (out_ctrl, out_val)
 }
+fn decode_via_os(path: &std::path::Path) -> Option<image::RgbImage> {
+    let tmp = std::env::temp_dir().join(format!("scanrs_osdecode_{}.png", std::process::id()));
+    let src = path.to_string_lossy().replace('\'', "''");
+    let tmps = tmp.to_string_lossy().replace('\'', "''");
+    let cmd = format!(
+        "Add-Type -AssemblyName System.Drawing; $i = [System.Drawing.Image]::FromFile('{src}'); $i.Save('{tmps}', [System.Drawing.Imaging.ImageFormat]::Png); $i.Dispose()"
+    );
+    let st = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &cmd])
+        .output()
+        .ok()?;
+    if !st.status.success() {
+        return None;
+    }
+    let im = image::open(&tmp).ok()?;
+    let _ = std::fs::remove_file(&tmp);
+    Some(im.to_rgb8())
+}
+
+fn load_input(path: &std::path::Path) -> image::RgbImage {
+    match image::open(path) {
+        Ok(im) => im.to_rgb8(),
+        Err(e) => {
+            println!("jpeg_fallback        : primary decoder failed ({e}), using zune-jpeg");
+            let data = fs::read(path).expect("read input file");
+            let mut dec = zune_jpeg::JpegDecoder::new(&data);
+            let px = match dec.decode() {
+                Ok(v) => v,
+                Err(_) => {
+                    println!("os_fallback          : zune failed too, using Windows codec (GDI+)");
+                    return decode_via_os(path).expect("all decoders failed on this file");
+                }
+            };
+            let (w, h) = dec.dimensions().expect("zune dims");
+            let n = (w * h) as usize;
+            let ch = if px.len() == n { 1usize } else if px.len() == n * 4 { 4 } else { 3 };
+            let (w, h) = (w as u32, h as u32);
+            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+            for p in px.chunks(ch) {
+                if ch == 1 {
+                    rgb.push(p[0]); rgb.push(p[0]); rgb.push(p[0]);
+                } else {
+                    rgb.push(p[0]); rgb.push(p[1]); rgb.push(p[2]);
+                }
+            }
+            image::RgbImage::from_raw(w, h, rgb).expect("rgb from raw")
+        }
+    }
+}
+
 fn cleanup_debug(out_dir: &PathBuf) {
     for n in [
         "step5_detect.png",
@@ -1347,9 +1550,9 @@ fn main() {
     }
     if !input.exists() { make_test_image(&input); }
 
-    let img0 = image::open(&input).expect("failed to open input image");
+    let img0 = load_input(&input);
     let img = if precurl {
-        let rgb0 = img0.to_rgb8();
+        let rgb0 = img0.clone();
         let (iw, ih) = (rgb0.width(), rgb0.height());
         let pi = std::f64::consts::PI;
         let ax = (iw as f64 * 0.03).max(6.0);
@@ -1387,7 +1590,7 @@ fn main() {
         }
         image::DynamicImage::ImageRgb8(curled)
     } else {
-        img0
+        image::DynamicImage::ImageRgb8(img0)
     };
     let gray = img.to_luma8();
 
